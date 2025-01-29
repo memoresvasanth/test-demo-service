@@ -67,7 +67,7 @@ resource "aws_route_table_association" "subnet2_association" {
 
 # Create ECR repository
 resource "aws_ecr_repository" "test_demo_service" {
-  name = "test-demo-service"
+  name = "test-demo-service-ecr"
 }
 
 # Create ECS Cluster
@@ -124,30 +124,9 @@ resource "aws_ecs_task_definition" "test_demo_service_task" {
   ])
 }
 
-# Create Security Group for ECS Service
-resource "aws_security_group" "ecs_service_sg" {
-  name        = "test-demo-service-sg"
-  description = "Allow HTTP traffic"
-  vpc_id      = aws_vpc.test_demo_vpc.id
-
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-# Create Security Group for Load Balancer
-resource "aws_security_group" "lb_sg" {
-  name        = "test-demo-service-lb-sg"
+# Create Security Group for ECS Service and Load Balancer
+resource "aws_security_group" "ecs_lb_sg" {
+  name        = "test-demo-service-ecs-lb-sg"
   description = "Allow HTTP traffic"
   vpc_id      = aws_vpc.test_demo_vpc.id
 
@@ -176,7 +155,7 @@ resource "aws_ecs_service" "test_demo_service_ecs_service" {
 
   network_configuration {
     subnets         = [aws_subnet.subnet1.id, aws_subnet.subnet2.id]
-    security_groups = [aws_security_group.ecs_service_sg.id]
+    security_groups = [aws_security_group.ecs_lb_sg.id]
   }
 
   load_balancer {
@@ -191,7 +170,7 @@ resource "aws_lb" "test_demo_service_lb" {
   name               = "test-demo-service-lb"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.lb_sg.id]
+  security_groups    = [aws_security_group.ecs_lb_sg.id]
   subnets            = [aws_subnet.subnet1.id, aws_subnet.subnet2.id]
 
   enable_deletion_protection = false
@@ -228,6 +207,163 @@ resource "aws_lb_target_group" "test_demo_service_tg" {
 
   lifecycle {
     prevent_destroy = true
+  }
+}
+
+# Create S3 Bucket for CodePipeline Artifacts
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+resource "aws_s3_bucket" "codepipeline_bucket" {
+  bucket = "test-demo-service-artifacts-${random_id.suffix.hex}"
+  acl    = "private"
+
+  tags = {
+    Name = "test-demo-service-artifacts"
+  }
+}
+
+# Create IAM Role for CodeBuild
+resource "aws_iam_role" "codebuild_role" {
+  name = "test-demo-service-codebuild-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "codebuild.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "codebuild_policy" {
+  role       = aws_iam_role.codebuild_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess"
+}
+
+# Create IAM Role for CodePipeline
+resource "aws_iam_role" "codepipeline_role" {
+  name = "test-demo-service-codepipeline-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "codepipeline.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "codepipeline_policy" {
+  role       = aws_iam_role.codepipeline_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess"
+}
+
+# Create CodeBuild Project
+resource "aws_codebuild_project" "test_demo_service_codebuild" {
+  name          = "test-demo-service-codebuild"
+  service_role  = aws_iam_role.codebuild_role.arn
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+  environment {
+    compute_type                = "BUILD_GENERAL1_SMALL"
+    image                       = "aws/codebuild/standard:5.0"
+    type                        = "LINUX_CONTAINER"
+    privileged_mode             = true
+    environment_variable {
+      name  = "AWS_ACCOUNT_ID"
+      value = var.aws_account_id
+    }
+    environment_variable {
+      name  = "AWS_DEFAULT_REGION"
+      value = "us-east-1"
+    }
+  }
+  source {
+    type      = "CODEPIPELINE"
+  }
+  cache {
+    type = "NO_CACHE"
+  }
+}
+
+# Create CodePipeline
+resource "aws_codepipeline" "test_demo_service_codepipeline" {
+  name     = "test-demo-service-codepipeline"
+  role_arn = aws_iam_role.codepipeline_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.codepipeline_bucket.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "ThirdParty"
+      provider         = "GitHub"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        Owner      = "memoresvasanth"
+        Repo       = "test-demo-service"
+        Branch     = "main"
+        OAuthToken = var.github_oauth_token
+      }
+    }
+  }
+
+  stage {
+    name = "Build"
+
+    action {
+      name             = "Build"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      version          = "1"
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["build_output"]
+
+      configuration = {
+        ProjectName = aws_codebuild_project.test_demo_service_codebuild.name
+      }
+    }
+  }
+
+  stage {
+    name = "Deploy"
+
+    action {
+      name             = "Deploy"
+      category         = "Deploy"
+      owner            = "AWS"
+      provider         = "ECS"
+      version          = "1"
+      input_artifacts  = ["build_output"]
+
+      configuration = {
+        ClusterName = aws_ecs_cluster.test_demo_service_ecs_cluster.name
+        ServiceName = aws_ecs_service.test_demo_service_ecs_service.name
+        FileName    = "imagedefinitions.json"
+      }
+    }
   }
 }
 
